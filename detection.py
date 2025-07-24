@@ -42,6 +42,16 @@ class IMUData:
     mag_z: float = 0.0
 
 @dataclass
+class MotionState:
+    """3D motion state estimation"""
+    position: np.ndarray
+    velocity: np.ndarray
+    acceleration: np.ndarray
+    orientation: np.ndarray
+    angular_velocity: np.ndarray
+    confidence: float
+
+@dataclass
 class DetectionResult:
     """Structure for detection results"""
     track_id: int
@@ -57,24 +67,468 @@ class DetectionResult:
     v_pos: str
     dist_cat: str
 
-class SafetyZoneManager:
-    """Manages safety zones and collision prediction"""
+class IMUProcessor:
+    """Process IMU data for motion estimation - essential for blind navigation"""
     
     def __init__(self):
-        self.danger_zone = 1.0  # meters
-        self.warning_zone = 2.0  # meters
-        self.caution_zone = 3.0  # meters
+        self.imu_history = deque(maxlen=100)
+        self.motion_state = MotionState(
+            position=np.zeros(3),
+            velocity=np.zeros(3),
+            acceleration=np.zeros(3),
+            orientation=np.array([1, 0, 0, 0]),  # quaternion
+            angular_velocity=np.zeros(3),
+            confidence=0.0
+        )
         
-        # Movement prediction
-        self.velocity_threshold = 0.5  # m/s
-        self.approach_threshold = 2.0  # seconds to collision
+        # Kalman filter parameters
+        self.dt = 1/30.0  # Assuming 30Hz update rate
+        self.gravity = np.array([0, 0, -9.81])
+        
+        # Low-pass filter for accelerometer
+        self.accel_filter_b, self.accel_filter_a = butter(2, 0.1, 'low')
+        self.accel_buffer = deque(maxlen=10)
+        self.gyro_buffer = deque(maxlen=10)
+        
+        # Bias estimation
+        self.accel_bias = np.zeros(3)
+        self.gyro_bias = np.zeros(3)
+        self.bias_samples = 0
+        self.bias_estimation_samples = 100
+        
+    def add_imu_data(self, imu_data: IMUData):
+        """Add new IMU data and update motion estimation"""
+        self.imu_history.append(imu_data)
+        
+        # Convert to numpy arrays
+        accel = np.array([imu_data.accel_x, imu_data.accel_y, imu_data.accel_z])
+        gyro = np.array([imu_data.gyro_x, imu_data.gyro_y, imu_data.gyro_z])
+        
+        # Bias estimation during initial calibration
+        if self.bias_samples < self.bias_estimation_samples:
+            self.accel_bias = (self.accel_bias * self.bias_samples + accel) / (self.bias_samples + 1)
+            self.gyro_bias = (self.gyro_bias * self.bias_samples + gyro) / (self.bias_samples + 1)
+            self.bias_samples += 1
+            return
+        
+        # Remove bias
+        accel_corrected = accel - self.accel_bias
+        gyro_corrected = gyro - self.gyro_bias
+        
+        # Add to buffers for filtering
+        self.accel_buffer.append(accel_corrected)
+        self.gyro_buffer.append(gyro_corrected)
+        
+        if len(self.accel_buffer) < 5:
+            return
+        
+        # Apply low-pass filter
+        accel_filtered = self._apply_filter(self.accel_buffer, self.accel_filter_b, self.accel_filter_a)
+        
+        # Update orientation using gyroscope
+        self._update_orientation(gyro_corrected)
+        
+        # Remove gravity from acceleration
+        gravity_world = self._rotate_vector(self.gravity, self.motion_state.orientation)
+        accel_world = self._rotate_vector(accel_filtered, self.motion_state.orientation) - gravity_world
+        
+        # Update motion state
+        self.motion_state.acceleration = accel_world
+        self.motion_state.velocity += accel_world * self.dt
+        self.motion_state.position += self.motion_state.velocity * self.dt
+        self.motion_state.angular_velocity = gyro_corrected
+        
+        # Apply velocity damping to prevent drift
+        self.motion_state.velocity *= 0.95
+        
+        # Calculate confidence based on data consistency
+        self._update_confidence()
+    
+    def _apply_filter(self, buffer, b, a):
+        """Apply low-pass filter to buffer data"""
+        if len(buffer) < 5:
+            return buffer[-1]
+        
+        data = np.array(buffer)
+        filtered = filtfilt(b, a, data.T).T
+        return filtered[-1]
+    
+    def _update_orientation(self, gyro):
+        """Update orientation using gyroscope data"""
+        # Convert angular velocity to quaternion update
+        norm = np.linalg.norm(gyro)
+        if norm > 0:
+            axis = gyro / norm
+            angle = norm * self.dt
+            
+            # Create rotation quaternion
+            q_rot = np.array([
+                np.cos(angle/2),
+                axis[0] * np.sin(angle/2),
+                axis[1] * np.sin(angle/2),
+                axis[2] * np.sin(angle/2)
+            ])
+            
+            # Apply rotation to current orientation
+            self.motion_state.orientation = self._quaternion_multiply(
+                self.motion_state.orientation, q_rot
+            )
+            
+            # Normalize quaternion
+            self.motion_state.orientation /= np.linalg.norm(self.motion_state.orientation)
+    
+    def _quaternion_multiply(self, q1, q2):
+        """Multiply two quaternions"""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2
+        ])
+    
+    def _rotate_vector(self, vector, quaternion):
+        """Rotate vector by quaternion"""
+        # Convert quaternion to rotation matrix
+        rotation = R.from_quat([quaternion[1], quaternion[2], quaternion[3], quaternion[0]])
+        return rotation.apply(vector)
+    
+    def _update_confidence(self):
+        """Update confidence based on data consistency"""
+        if len(self.imu_history) < 10:
+            self.motion_state.confidence = 0.0
+            return
+        
+        # Calculate variance in recent measurements
+        recent_accel = np.array([[d.accel_x, d.accel_y, d.accel_z] for d in list(self.imu_history)[-10:]])
+        accel_variance = np.var(recent_accel, axis=0).mean()
+        
+        # Confidence inversely related to variance
+        self.motion_state.confidence = max(0.0, min(1.0, 1.0 - accel_variance / 10.0))
+
+class NetworkServer:
+    """TCP and UDP server for receiving phone sensor data - critical for blind navigation"""
+    
+    def __init__(self, tcp_port=8888, udp_port=8889):
+        self.tcp_port = tcp_port
+        self.udp_port = udp_port
+        self.running = False
+        self.imu_queue = queue.Queue()
+        
+        # Server sockets
+        self.tcp_socket = None
+        self.udp_socket = None
+        
+        # Client connections
+        self.tcp_clients = []
+        
+    def start_servers(self):
+        """Start TCP and UDP servers"""
+        self.running = True
+        
+        # Start TCP server thread
+        tcp_thread = threading.Thread(target=self._tcp_server, daemon=True)
+        tcp_thread.start()
+        
+        # Start UDP server thread
+        udp_thread = threading.Thread(target=self._udp_server, daemon=True)
+        udp_thread.start()
+        
+        print(f"Network servers started - TCP: {self.tcp_port}, UDP: {self.udp_port}")
+    
+    def _tcp_server(self):
+        """TCP server for reliable data transmission"""
+        self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        try:
+            self.tcp_socket.bind(('0.0.0.0', self.tcp_port))
+            self.tcp_socket.listen(5)
+            print(f"TCP server listening on port {self.tcp_port}")
+            
+            while self.running:
+                try:
+                    client_socket, address = self.tcp_socket.accept()
+                    print(f"TCP client connected: {address}")
+                    
+                    client_thread = threading.Thread(
+                        target=self._handle_tcp_client,
+                        args=(client_socket, address),
+                        daemon=True
+                    )
+                    client_thread.start()
+                    
+                except socket.error:
+                    if self.running:
+                        print("TCP server error")
+                    break
+                    
+        except Exception as e:
+            print(f"TCP server error: {e}")
+        finally:
+            if self.tcp_socket:
+                self.tcp_socket.close()
+    
+    def _handle_tcp_client(self, client_socket, address):
+        """Handle TCP client connection"""
+        try:
+            while self.running:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                
+                try:
+                    # Parse JSON data
+                    json_data = json.loads(data.decode('utf-8'))
+                    self._process_sensor_data(json_data)
+                    
+                    # Send acknowledgment
+                    client_socket.send(b"OK")
+                    
+                except json.JSONDecodeError:
+                    client_socket.send(b"ERROR")
+                    
+        except Exception as e:
+            print(f"TCP client error: {e}")
+        finally:
+            client_socket.close()
+            print(f"TCP client disconnected: {address}")
+    
+    def _udp_server(self):
+        """UDP server for high-frequency data"""
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        try:
+            self.udp_socket.bind(('0.0.0.0', self.udp_port))
+            print(f"UDP server listening on port {self.udp_port}")
+            
+            while self.running:
+                try:
+                    data, address = self.udp_socket.recvfrom(1024)
+                    
+                    try:
+                        # Parse JSON data
+                        json_data = json.loads(data.decode('utf-8'))
+                        self._process_sensor_data(json_data)
+                        
+                    except json.JSONDecodeError:
+                        continue
+                        
+                except socket.error:
+                    if self.running:
+                        print("UDP server error")
+                    break
+                    
+        except Exception as e:
+            print(f"UDP server error: {e}")
+        finally:
+            if self.udp_socket:
+                self.udp_socket.close()
+    
+    def _process_sensor_data(self, data):
+        """Process incoming sensor data"""
+        try:
+            # Expected JSON format:
+            # {
+            #     "timestamp": 1234567890.123,
+            #     "accelerometer": {"x": 0.1, "y": 0.2, "z": 9.8},
+            #     "gyroscope": {"x": 0.01, "y": 0.02, "z": 0.03},
+            # }
+            
+            timestamp = data.get('timestamp', time.time())
+            accel = data.get('accelerometer', {})
+            gyro = data.get('gyroscope', {})
+            
+            imu_data = IMUData(
+                timestamp=timestamp,
+                accel_x=accel.get('x', 0.0),
+                accel_y=accel.get('y', 0.0),
+                accel_z=accel.get('z', 0.0),
+                gyro_x=gyro.get('x', 0.0),
+                gyro_y=gyro.get('y', 0.0),
+                gyro_z=gyro.get('z', 0.0),
+            )
+            
+            self.imu_queue.put(imu_data)
+            
+        except Exception as e:
+            print(f"Error processing sensor data: {e}")
+    
+    def get_imu_data(self):
+        """Get latest IMU data from queue"""
+        imu_data_list = []
+        while not self.imu_queue.empty():
+            try:
+                imu_data_list.append(self.imu_queue.get_nowait())
+            except queue.Empty:
+                break
+        return imu_data_list
+    
+    def stop_servers(self):
+        """Stop network servers"""
+        self.running = False
+        
+        if self.tcp_socket:
+            self.tcp_socket.close()
+        if self.udp_socket:
+            self.udp_socket.close()
+
+class Enhanced3DGuidance:
+    """Enhanced 3D guidance system specifically designed for blind navigation"""
+    
+    def __init__(self):
+        self.imu_processor = IMUProcessor()
+        
+        # 3D spatial awareness for navigation
+        self.spatial_awareness = {
+            'forward': deque(maxlen=10),
+            'left': deque(maxlen=10),
+            'right': deque(maxlen=10),
+            'above': deque(maxlen=10),
+            'below': deque(maxlen=10)
+        }
+        
+        # Motion prediction for safety
+        self.motion_predictor = deque(maxlen=20)
+        
+        # Navigation assistance
+        self.path_history = deque(maxlen=50)
+        self.obstacle_memory = {}
+        
+    def update_motion_state(self, imu_data_list):
+        """Update 3D motion state with IMU data"""
+        # Process IMU data
+        for imu_data in imu_data_list:
+            self.imu_processor.add_imu_data(imu_data)
+        
+        # Update motion predictor
+        motion_data = {
+            'velocity': self.imu_processor.motion_state.velocity,
+            'position': self.imu_processor.motion_state.position,
+            'orientation': self.imu_processor.motion_state.orientation,
+            'confidence': self.imu_processor.motion_state.confidence,
+            'timestamp': time.time()
+        }
+        self.motion_predictor.append(motion_data)
+        
+        return motion_data
+    
+    def predict_collision_risk(self, detections, motion_data):
+        """Predict collision risk based on 3D motion - critical for blind safety"""
+        risks = []
+        
+        for detection in detections:
+            # Get object position and velocity
+            obj_pos = np.array([detection.center[0], detection.center[1], detection.depth])
+            obj_velocity = np.array([detection.velocity, 0, 0])  # Simplified
+            
+            # Get user motion
+            user_pos = motion_data['position']
+            user_velocity = motion_data['velocity']
+            
+            # Calculate relative position and velocity
+            relative_pos = obj_pos - user_pos
+            relative_vel = obj_velocity - user_velocity
+            
+            # Time to collision
+            relative_speed = np.linalg.norm(relative_vel)
+            if relative_speed > 0.1:
+                time_to_collision = np.linalg.norm(relative_pos) / relative_speed
+            else:
+                time_to_collision = float('inf')
+            
+            # Risk assessment for blind navigation
+            if time_to_collision < 1.5:  # Less than 1.5 seconds - immediate danger
+                risk_level = "CRITICAL"
+            elif time_to_collision < 3.0:  # Less than 3 seconds - high risk
+                risk_level = "HIGH"
+            elif time_to_collision < 5.0:  # Less than 5 seconds - moderate risk
+                risk_level = "MEDIUM"
+            else:
+                risk_level = "LOW"
+            
+            risks.append({
+                'detection': detection,
+                'time_to_collision': time_to_collision,
+                'risk_level': risk_level,
+                'relative_velocity': relative_vel
+            })
+        
+        return sorted(risks, key=lambda x: x['time_to_collision'])
+    
+    def generate_navigation_guidance(self, risks, motion_data):
+        """Generate navigation guidance specifically for blind users"""
+        if not risks:
+            return "Path clear ahead. Safe to continue."
+        
+        guidance_parts = []
+        critical_objects = [r for r in risks if r['risk_level'] == 'CRITICAL']
+        high_risk_objects = [r for r in risks if r['risk_level'] == 'HIGH']
+        
+        # Critical immediate dangers
+        if critical_objects:
+            guidance_parts.append("STOP IMMEDIATELY!")
+            for risk in critical_objects[:1]:  # Only announce the most critical
+                obj = risk['detection'].label
+                pos = risk['detection'].h_pos
+                dist = risk['detection'].depth
+                guidance_parts.append(f"{obj} directly ahead at {dist:.1f} meters")
+        
+        # High risk objects requiring caution
+        elif high_risk_objects:
+            for risk in high_risk_objects[:2]:  # Top 2 high-risk objects
+                obj = risk['detection'].label
+                pos = risk['detection'].h_pos
+                dist = risk['detection'].depth
+                
+                if dist < 1.0:
+                    guidance_parts.append(f"Caution: {obj} very close {pos}")
+                else:
+                    guidance_parts.append(f"{obj} approaching {pos} at {dist:.1f} meters")
+        
+        # General navigation guidance
+        else:
+            medium_risk = [r for r in risks if r['risk_level'] == 'MEDIUM']
+            if medium_risk:
+                for risk in medium_risk[:1]:  # One medium risk object
+                    obj = risk['detection'].label
+                    pos = risk['detection'].h_pos
+                    dist = risk['detection'].depth
+                    guidance_parts.append(f"{obj} detected {pos} at {dist:.1f} meters")
+        
+        # Add navigation suggestions based on user motion
+        user_velocity = motion_data['velocity']
+        if np.linalg.norm(user_velocity) > 0.2:
+            # User is moving, provide motion-aware guidance
+            if len(guidance_parts) > 0:
+                guidance_parts.append("Recommend slowing down")
+        
+        return ". ".join(guidance_parts[:3]) + "."
+
+class SafetyZoneManager:
+    """Manages safety zones specifically for blind navigation"""
+    
+    def __init__(self):
+        # Adjusted zones for blind users - more conservative
+        self.critical_zone = 0.8   # meters - immediate stop
+        self.danger_zone = 1.5     # meters - high alert
+        self.warning_zone = 2.5    # meters - caution
+        self.caution_zone = 4.0    # meters - awareness
+        
+        # Movement prediction with safety margins
+        self.velocity_threshold = 0.3  # m/s
+        self.approach_threshold = 3.0  # seconds to collision
         
     def get_zone_type(self, depth: float, velocity: float = 0.0) -> str:
         """Determine safety zone based on depth and velocity"""
-        # Adjust zone based on approaching velocity
-        effective_depth = depth - (velocity * 2.0)  # 2-second prediction
+        # Adjust zone based on approaching velocity with safety margin
+        effective_depth = depth - (velocity * 3.0)  # 3-second prediction for safety
         
-        if effective_depth <= self.danger_zone:
+        if effective_depth <= self.critical_zone:
+            return "CRITICAL"
+        elif effective_depth <= self.danger_zone:
             return "DANGER"
         elif effective_depth <= self.warning_zone:
             return "WARNING"
@@ -236,7 +690,7 @@ class VelocityTracker:
             pixel_velocity = math.sqrt(dx*dx + dy*dy) / dt
             velocity_ms = pixel_velocity * 0.01  # Approximate conversion factor
             
-            # Determine direction
+            # Determine direction for blind navigation
             if pixel_velocity < 5:  # Threshold for stationary
                 direction = "stationary"
             else:
@@ -268,27 +722,33 @@ class VelocityTracker:
                 self.last_time.pop(track_id, None)
 
 class AudioFeedback:
-    """Handles text-to-speech feedback with priority queue"""
+    """Handles text-to-speech feedback with priority queue - critical for blind users"""
     
     def __init__(self):
         self.tts = None
         self._initialize_tts()
-        self.audio_queue = queue.PriorityQueue(maxsize=5)
+        self.audio_queue = queue.PriorityQueue(maxsize=10)  # Larger queue for blind navigation
         self.is_speaking = False
         self.audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self.audio_thread.start()
         
     def _initialize_tts(self):
-        """Initialize text-to-speech engine"""
+        """Initialize text-to-speech engine with settings optimized for blind users"""
         try:
             self.tts = pyttsx3.init()
-            self.tts.setProperty('rate', 180)
-            self.tts.setProperty('volume', 0.9)
+            self.tts.setProperty('rate', 160)  # Slightly slower for clarity
+            self.tts.setProperty('volume', 1.0)  # Maximum volume
             
             # Try to set a clear voice
             voices = self.tts.getProperty('voices')
             if voices:
-                self.tts.setProperty('voice', voices[0].id)
+                # Prefer female voice if available (often clearer)
+                for voice in voices:
+                    if 'female' in voice.name.lower() or 'woman' in voice.name.lower():
+                        self.tts.setProperty('voice', voice.id)
+                        break
+                else:
+                    self.tts.setProperty('voice', voices[0].id)
                 
         except Exception as e:
             print(f"Warning: Could not initialize TTS: {e}")
@@ -320,27 +780,40 @@ class AudioFeedback:
             timestamp = time.time()
             self.audio_queue.put_nowait((priority, timestamp, text))
         except queue.Full:
-            # If queue is full, ignore non-critical messages
-            if priority <= 2:  # Only keep high priority messages
+            # If queue is full, prioritize critical safety messages
+            if priority <= 1:  # Critical safety messages
                 try:
-                    self.audio_queue.get_nowait()  # Remove oldest
+                    # Remove lowest priority messages
+                    temp_items = []
+                    while not self.audio_queue.empty():
+                        item = self.audio_queue.get_nowait()
+                        if item[0] <= 2:  # Keep high priority items
+                            temp_items.append(item)
+                    
+                    # Put back high priority items
+                    for item in temp_items:
+                        self.audio_queue.put_nowait(item)
+                    
+                    # Add new critical message
                     self.audio_queue.put_nowait((priority, timestamp, text))
                 except queue.Empty:
                     pass
 
 class GuidanceGenerator:
-    """Generates intelligent guidance based on detections"""
+    """Generates intelligent guidance specifically designed for blind users"""
     
     def __init__(self):
+        # Priority classes optimized for blind navigation
         self.priority_classes = {
             'person': 1, 'bicycle': 1, 'car': 1, 'motorcycle': 1, 
-            'bus': 1, 'truck': 1, 'traffic light': 2,
-            'chair': 3, 'dining table': 3, 'door': 2, 
-            'handbag': 4, 'backpack': 4, 'umbrella': 4, 'bottle': 4
+            'bus': 1, 'truck': 1, 'traffic light': 1, 'stop sign': 1,
+            'stairs': 1, 'escalator': 1, 'door': 2, 'chair': 2,
+            'dining table': 2, 'bench': 2, 'pole': 2,
+            'handbag': 4, 'backpack': 4, 'umbrella': 4, 'bottle': 5
         }
         
         self.last_guidance_time = 0
-        self.guidance_interval = 2.0  # seconds
+        self.guidance_interval = 1.5  # More frequent guidance for blind users
         self.last_guidance = ""
         
     def get_priority(self, label: str) -> int:
@@ -349,20 +822,24 @@ class GuidanceGenerator:
     
     def get_position_description(self, bbox: Tuple[int, int, int, int], 
                                 frame_shape: Tuple[int, int]) -> Tuple[str, str]:
-        """Get human-readable position description"""
+        """Get human-readable position description optimized for blind navigation"""
         x1, y1, x2, y2 = bbox
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         frame_h, frame_w = frame_shape
         
-        # Horizontal position
+        # More precise horizontal position for navigation
         h_ratio = cx / frame_w
-        if h_ratio < 0.2:
+        if h_ratio < 0.15:
             h_pos = "far left"
-        elif h_ratio < 0.4:
+        elif h_ratio < 0.35:
             h_pos = "left"
-        elif h_ratio < 0.6:
-            h_pos = "center"
-        elif h_ratio < 0.8:
+        elif h_ratio < 0.45:
+            h_pos = "slightly left"
+        elif h_ratio < 0.55:
+            h_pos = "directly ahead"
+        elif h_ratio < 0.65:
+            h_pos = "slightly right"
+        elif h_ratio < 0.85:
             h_pos = "right"
         else:
             h_pos = "far right"
@@ -379,10 +856,12 @@ class GuidanceGenerator:
         return h_pos, v_pos
     
     def get_distance_category(self, depth: float) -> str:
-        """Categorize distance for speech"""
-        if depth < 1.0:
+        """Categorize distance for speech with blind-specific terms"""
+        if depth < 0.8:
+            return "immediate proximity"
+        elif depth < 1.5:
             return "very close"
-        elif depth < 2.0:
+        elif depth < 2.5:
             return "close"
         elif depth < 4.0:
             return "nearby"
@@ -391,45 +870,50 @@ class GuidanceGenerator:
     
     def generate_guidance(self, detections: List[DetectionResult], 
                          force: bool = False) -> Optional[str]:
-        """Generate guidance message based on detections"""
+        """Generate guidance message specifically for blind navigation"""
         current_time = time.time()
         
         if not force and (current_time - self.last_guidance_time) < self.guidance_interval:
             return None
         
         if not detections:
-            guidance = "Path clear"
+            guidance = "Path appears clear"
         else:
             # Sort by priority and distance
             priority_detections = sorted(detections, 
                                        key=lambda x: (x.priority, x.depth))
             
-            # Focus on most important objects
-            important_objects = []
-            for det in priority_detections[:3]:  # Top 3 most important
-                if det.depth < 4.0:  # Only mention nearby objects
-                    important_objects.append(det)
+            # Focus on most important objects for navigation
+            navigation_objects = []
+            for det in priority_detections:
+                if det.depth < 5.0:  # Only mention nearby objects
+                    navigation_objects.append(det)
             
-            if not important_objects:
-                guidance = "Path clear"
+            if not navigation_objects:
+                guidance = "Path appears clear"
             else:
                 guidance_parts = []
                 
-                for det in important_objects:
+                # Process most critical objects first
+                for i, det in enumerate(navigation_objects[:3]):  # Top 3 most important
                     safety_zone = SafetyZoneManager().get_zone_type(det.depth, det.velocity)
                     
-                    if safety_zone == "DANGER":
+                    if safety_zone == "CRITICAL":
                         guidance_parts.append(f"STOP! {det.label} {det.h_pos}")
+                        break  # Stop processing if critical danger detected
+                    elif safety_zone == "DANGER":
+                        guidance_parts.append(f"Danger: {det.label} {det.h_pos} at {det.depth:.1f} meters")
                     elif safety_zone == "WARNING":
-                        guidance_parts.append(f"Caution, {det.label} {det.h_pos}")
-                    elif det.velocity > 0.5:
-                        guidance_parts.append(f"{det.label} {det.direction} {det.h_pos}")
-                    else:
+                        if det.velocity > 0.5:
+                            guidance_parts.append(f"Moving {det.label} {det.h_pos}")
+                        else:
+                            guidance_parts.append(f"{det.label} {det.h_pos} at {det.depth:.1f} meters")
+                    elif i == 0:  # Only mention first caution object to avoid information overload
                         guidance_parts.append(f"{det.label} {det.h_pos}")
                 
-                guidance = ". ".join(guidance_parts[:2])  # Limit to 2 objects
+                guidance = ". ".join(guidance_parts[:2])  # Limit to prevent information overload
         
-        # Avoid repeating same guidance
+        # Avoid repeating same guidance unless forced
         if guidance != self.last_guidance or force:
             self.last_guidance = guidance
             self.last_guidance_time = current_time
@@ -438,12 +922,19 @@ class GuidanceGenerator:
         return None
 
 class EnhancedObstacleDetector:
-    """Main obstacle detection system with improved architecture"""
+    """Main obstacle detection system enhanced for blind navigation with phone sensor integration"""
     
-    def __init__(self, detection_thresh: float = 0.5, max_display_distance: float = 10.0):
+    def __init__(self, detection_thresh: float = 0.5, max_display_distance: float = 10.0, 
+                 tcp_port: int = 8888, udp_port: int = 8889):
         # Core parameters
         self.detection_thresh = detection_thresh
         self.max_display_distance = max_display_distance
+        
+        # Network server for phone integration
+        self.network_server = NetworkServer(tcp_port, udp_port)
+        
+        # Enhanced 3D guidance system
+        self.guidance_3d = Enhanced3DGuidance()
         
         # Initialize components
         self._initialize_models()
@@ -453,16 +944,17 @@ class EnhancedObstacleDetector:
         self.frame_count = 0
         self.last_process_time = time.time()
         
-        # Colors for visualization
+        # Colors for visualization (still useful for sighted assistants)
         self.colors = {
-            'danger': (0, 0, 255),    # Red
-            'warning': (0, 165, 255), # Orange
-            'caution': (0, 255, 255), # Yellow
-            'safe': (0, 255, 0),      # Green
-            'text': (255, 255, 255)   # White
+            'critical': (0, 0, 128),     # Dark red
+            'danger': (0, 0, 255),       # Red
+            'warning': (0, 165, 255),    # Orange
+            'caution': (0, 255, 255),    # Yellow
+            'safe': (0, 255, 0),         # Green
+            'text': (255, 255, 255)      # White
         }
         
-        print("Enhanced Obstacle Detector initialized successfully")
+        print("Enhanced Obstacle Detector for Blind Navigation initialized successfully")
     
     def _initialize_models(self):
         """Initialize ML models"""
@@ -487,9 +979,26 @@ class EnhancedObstacleDetector:
         self.audio_feedback = AudioFeedback()
         self.guidance_generator = GuidanceGenerator()
         
+    def start_phone_integration(self):
+        """Start phone sensor integration servers"""
+        self.network_server.start_servers()
+        print("Phone sensor integration started")
+        self.audio_feedback.speak("Phone sensor integration ready", priority=3)
+    
+    def stop_phone_integration(self):
+        """Stop phone sensor integration servers"""
+        self.network_server.stop_servers()
+        print("Phone sensor integration stopped")
+    
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[DetectionResult]]:
         """Process a single frame and return annotated frame with detections"""
         start_time = time.time()
+        
+        # Get IMU data from phone
+        imu_data_list = self.network_server.get_imu_data()
+        
+        # Update motion state with IMU data
+        motion_data = self.guidance_3d.update_motion_state(imu_data_list)
         
         # Run YOLO detection
         results = self.model(frame, conf=self.detection_thresh, verbose=False)
@@ -560,27 +1069,43 @@ class EnhancedObstacleDetector:
         # Clean up old tracks
         self.velocity_tracker.cleanup_old_tracks(active_track_ids)
         
-        # Generate guidance
-        guidance = self.guidance_generator.generate_guidance(structured_detections)
+        # Predict collision risks using 3D guidance
+        collision_risks = self.guidance_3d.predict_collision_risk(structured_detections, motion_data)
+        
+        # Generate navigation guidance
+        if collision_risks:
+            guidance = self.guidance_3d.generate_navigation_guidance(collision_risks, motion_data)
+        else:
+            guidance = self.guidance_generator.generate_guidance(structured_detections)
+        
         if guidance:
             # Determine priority based on safety zones
+            has_critical = any(self.safety_zone.get_zone_type(d.depth, d.velocity) == "CRITICAL" 
+                             for d in structured_detections)
             has_danger = any(self.safety_zone.get_zone_type(d.depth, d.velocity) == "DANGER" 
                            for d in structured_detections)
-            priority = 1 if has_danger else 3
+            
+            if has_critical:
+                priority = 0  # Highest priority
+            elif has_danger:
+                priority = 1  # High priority
+            else:
+                priority = 3  # Normal priority
+                
             self.audio_feedback.speak(guidance, priority)
         
-        # Annotate frame
-        annotated_frame = self._annotate_frame(frame, structured_detections)
+        # Annotate frame (for sighted assistants or debugging)
+        annotated_frame = self._annotate_frame(frame, structured_detections, motion_data)
         
         # Update performance metrics
         self.frame_count += 1
-        process_time = time.time() - start_time
         
         return annotated_frame, structured_detections
     
     def _annotate_frame(self, frame: np.ndarray, 
-                       detections: List[DetectionResult]) -> np.ndarray:
-        """Annotate frame with detection results"""
+                       detections: List[DetectionResult],
+                       motion_data: Dict) -> np.ndarray:
+        """Annotate frame with detection results and motion data"""
         annotated = frame.copy()
         
         for det in detections:
@@ -591,7 +1116,7 @@ class EnhancedObstacleDetector:
             color = self.colors.get(zone_type.lower(), self.colors['safe'])
             
             # Draw bounding box
-            thickness = 3 if zone_type in ["DANGER", "WARNING"] else 2
+            thickness = 4 if zone_type in ["CRITICAL", "DANGER"] else 2
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
             
             # Prepare label text
@@ -620,14 +1145,15 @@ class EnhancedObstacleDetector:
             # Draw center point
             cv2.circle(annotated, det.center, 4, color, -1)
         
-        # Add system info
-        self._draw_system_info(annotated, detections)
+        # Add system info including IMU data
+        self._draw_system_info(annotated, detections, motion_data)
         
         return annotated
     
     def _draw_system_info(self, frame: np.ndarray, 
-                         detections: List[DetectionResult]):
-        """Draw system information on frame"""
+                         detections: List[DetectionResult],
+                         motion_data: Dict):
+        """Draw system information including IMU data on frame"""
         h, w = frame.shape[:2]
         
         # Performance info
@@ -636,17 +1162,31 @@ class EnhancedObstacleDetector:
         cv2.putText(frame, info_text, (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['text'], 2)
         
+        # IMU status
+        imu_confidence = motion_data.get('confidence', 0.0)
+        imu_text = f"IMU Confidence: {imu_confidence:.2f}"
+        cv2.putText(frame, imu_text, (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['text'], 2)
+        
+        # User velocity
+        user_velocity = motion_data.get('velocity', np.zeros(3))
+        velocity_norm = np.linalg.norm(user_velocity)
+        velocity_text = f"User Speed: {velocity_norm:.2f} m/s"
+        cv2.putText(frame, velocity_text, (10, 90), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['text'], 2)
+        
         # Zone legend
-        legend_y = h - 80
+        legend_y = h - 120
         zone_info = [
-            ("DANGER (<1m)", self.colors['danger']),
-            ("WARNING (<2m)", self.colors['warning']),
-            ("CAUTION (<3m)", self.colors['caution']),
-            ("SAFE (>3m)", self.colors['safe'])
+            ("CRITICAL (<0.8m)", self.colors['critical']),
+            ("DANGER (<1.5m)", self.colors['danger']),
+            ("WARNING (<2.5m)", self.colors['warning']),
+            ("CAUTION (<4m)", self.colors['caution']),
+            ("SAFE (>4m)", self.colors['safe'])
         ]
         
         for i, (text, color) in enumerate(zone_info):
-            x_pos = 10 + i * 150
+            x_pos = 10 + i * 140
             cv2.rectangle(frame, (x_pos, legend_y), (x_pos + 15, legend_y + 15), color, -1)
             cv2.putText(frame, text, (x_pos + 20, legend_y + 12),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.colors['text'], 1)
@@ -656,8 +1196,14 @@ class EnhancedObstacleDetector:
             cv2.putText(frame, "🔊 Speaking...", (w - 150, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
+        # Network status
+        imu_queue_size = len(self.network_server.get_imu_data()) if hasattr(self.network_server, 'get_imu_data') else 0
+        network_text = f"Phone Connected: {imu_queue_size > 0} | IMU Queue: {imu_queue_size}"
+        cv2.putText(frame, network_text, (10, h - 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['text'], 1)
+        
         # Controls
-        controls = "Controls: Q=Quit | SPACE=Manual Guidance | R=Reset"
+        controls = "Controls: Q=Quit | SPACE=Manual Guidance | R=Reset | P=Phone Status"
         cv2.putText(frame, controls, (10, h - 20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     
@@ -668,11 +1214,14 @@ class EnhancedObstacleDetector:
             self.audio_feedback.speak(guidance, priority=1)
             print(f"Manual guidance: {guidance}")
         else:
-            self.audio_feedback.speak("No objects detected", priority=1)
+            self.audio_feedback.speak("No objects detected in current view", priority=1)
             print("Manual guidance: No objects detected")
     
     def run(self, video_source: int = 0):
-        """Run the detection system with video input"""
+        """Run the detection system with video input and phone integration"""
+        # Start phone sensor integration
+        self.start_phone_integration()
+        
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
             print(f"Error: Could not open video source {video_source}")
@@ -683,15 +1232,16 @@ class EnhancedObstacleDetector:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         cap.set(cv2.CAP_PROP_FPS, 30)
         
-        print(f"Enhanced Obstacle Detection System Started")
+        print(f"Enhanced Obstacle Detection System for Blind Navigation Started")
         print(f"Video source: {video_source}")
         print(f"Device: {self.device}")
-        print("Press 'q' to quit, SPACE for manual guidance, 'r' to reset")
+        print(f"Phone sensor integration: TCP:{self.network_server.tcp_port}, UDP:{self.network_server.udp_port}")
+        print("Press 'q' to quit, SPACE for manual guidance, 'r' to reset, 'p' for phone status")
         
-        self.audio_feedback.speak("Enhanced obstacle detection system started", priority=2)
+        self.audio_feedback.speak("Enhanced navigation system started. Connect your phone for full 3D awareness.", priority=2)
         
-        cv2.namedWindow("Enhanced AssistVision", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Enhanced AssistVision", 1280, 720)
+        cv2.namedWindow("Enhanced AssistVision for Blind Navigation", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Enhanced AssistVision for Blind Navigation", 1280, 720)
         
         self.last_process_time = time.time()
         
@@ -706,7 +1256,7 @@ class EnhancedObstacleDetector:
                 processed_frame, detections = self.process_frame(frame)
                 
                 # Display frame
-                cv2.imshow("Enhanced AssistVision", processed_frame)
+                cv2.imshow("Enhanced AssistVision for Blind Navigation", processed_frame)
                 
                 # Handle keyboard input
                 key = cv2.waitKey(1) & 0xFF
@@ -718,6 +1268,12 @@ class EnhancedObstacleDetector:
                     self.frame_count = 0
                     self.last_process_time = time.time()
                     print("System reset")
+                    self.audio_feedback.speak("System reset", priority=2)
+                elif key == ord('p'):  # Phone status
+                    imu_data = self.network_server.get_imu_data()
+                    status = f"Phone connection: {'Active' if len(imu_data) > 0 else 'No data'}"
+                    print(status)
+                    self.audio_feedback.speak(status, priority=2)
                 
         except KeyboardInterrupt:
             print("\nStopping detection system...")
@@ -725,19 +1281,78 @@ class EnhancedObstacleDetector:
         finally:
             cap.release()
             cv2.destroyAllWindows()
-            self.audio_feedback.speak("Detection system stopped", priority=1)
+            self.stop_phone_integration()
+            self.audio_feedback.speak("Navigation system stopped", priority=1)
             print("Detection system stopped")
 
 # Utility functions for external use
 def create_detector(detection_thresh: float = 0.5, 
-                   max_display_distance: float = 10.0) -> EnhancedObstacleDetector:
-    """Factory function to create detector instance"""
-    return EnhancedObstacleDetector(detection_thresh, max_display_distance)
+                   max_display_distance: float = 10.0,
+                   tcp_port: int = 8888,
+                   udp_port: int = 8889) -> EnhancedObstacleDetector:
+    """Factory function to create detector instance with phone integration"""
+    return EnhancedObstacleDetector(detection_thresh, max_display_distance, tcp_port, udp_port)
+
+def create_phone_sensor_example():
+    """Example code for phone sensor data transmission"""
+    example_code = '''
+    // Android/iOS phone sensor example for blind navigation assistance
+    // Use TCP socket for reliable data transmission
+    
+    import socket
+    import json
+    import time
+    from sensors import accelerometer, gyroscope
+    
+    # TCP connection example
+    def send_sensor_data_tcp():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(('YOUR_COMPUTER_IP', 8888))  # Replace with actual IP
+        
+        while True:
+            accel = accelerometer.get_reading()
+            gyro = gyroscope.get_reading()
+            
+            data = {
+                "timestamp": time.time(),
+                "accelerometer": {"x": accel.x, "y": accel.y, "z": accel.z},
+                "gyroscope": {"x": gyro.x, "y": gyro.y, "z": gyro.z},
+            }
+            
+            sock.send(json.dumps(data).encode())
+            response = sock.recv(1024)
+            time.sleep(1/30)  # 30Hz update rate
+    
+    # UDP example (faster, for high-frequency data)
+    def send_sensor_data_udp():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        while True:
+            accel = accelerometer.get_reading()
+            gyro = gyroscope.get_reading()
+            
+            data = {
+                "timestamp": time.time(),
+                "accelerometer": {"x": accel.x, "y": accel.y, "z": accel.z},
+                "gyroscope": {"x": gyro.x, "y": gyro.y, "z": gyro.z}
+            }
+            
+            sock.sendto(json.dumps(data).encode(), ('YOUR_COMPUTER_IP', 8889))
+            time.sleep(1/100)  # 100Hz for high-frequency updates
+    '''
+    
+    print("Phone Sensor Integration Example for Blind Navigation:")
+    print(example_code)
 
 if __name__ == "__main__":
-    print("Enhanced Obstacle Detection System")
-    print("=" * 50)
+    print("Enhanced Obstacle Detection System for Blind Navigation")
+    print("=" * 60)
     
-    # Create and run detector
-    detector = EnhancedObstacleDetector()
+    # Show phone integration example
+    create_phone_sensor_example()
+    
+    print("\nStarting enhanced detection system...")
+    
+    # Create and run detector with phone integration
+    detector = EnhancedObstacleDetector(tcp_port=8888, udp_port=8889)
     detector.run()
