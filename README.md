@@ -360,13 +360,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Email: Vivektejaoppo1611@gmail.com
 - GitHub: [@vivekteja1611](https://github.com/vivekteja1611)
 
-## 🙏 Acknowledgments
-
-- **Open Source Community** for robust libraries and frameworks
-- **YOLO, MiDaS, DeepSORT teams** for excellent models and documentation
-- **PyQt5 and OpenCV communities** for comprehensive support
-- **Fellow students and mentors** for feedback and encouragement
-
 
 ## 🔗 Links
 
@@ -375,6 +368,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [GitHub Repository](https://github.com/vivekteja1611/Vivid)
 - [Presentation](https://vivekteja1611.github.io/Vivid-presentation/)
 
----
-
-*Made with ❤️ for the visually impaired community*
