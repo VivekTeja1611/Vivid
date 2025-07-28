@@ -3,7 +3,6 @@
 [![Demo Video](https://img.shields.io/badge/Demo-Video-red?style=for-the-badge)](https://vivekteja1611.github.io/Vivid-presentation/)
 [![GitHub Repository](https://img.shields.io/badge/GitHub-Repository-blue?style=for-the-badge)](https://github.com/vivekteja1611/Vivid)
 [![Python](https://img.shields.io/badge/Python-3.8+-blue?style=for-the-badge&logo=python)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 ## 🚀 Overview
 
