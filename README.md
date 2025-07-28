@@ -251,21 +251,6 @@ python app.py
 | Object Tracking | <20ms | 15-25ms | Scales with object count |
 | Memory Usage | <2GB | 1.5-2.2GB | Peak during initialization |
 
-## 🧪 Testing
-
-Run the test suite to verify installation:
-
-```bash
-# Test core functionality
-python test_detection.py
-
-# Test sensor integration
-python test_sensors.py
-
-# Performance benchmark
-python benchmark.py
-```
-
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -363,7 +348,7 @@ pytest tests/
 - [ ] Research publication and dataset creation
 
 ## 📚 Documentation
-- [API Reference](docs/api.md)
+- [API Reference](docs/Api.md)
 - [Architecture Overview](docs/architecture.md)
 - [Technical Report](VIVID_REPORT.pdf)
 
