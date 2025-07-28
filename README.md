@@ -375,10 +375,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
-- [Live Demo](https://vivekteja1611.github.io/Vivid-presentation/)
+- [Demo Video](https://drive.google.com/file/d/1GHeKTfjtDI4gCBrlhmDpoVAJFXV0YOuU/view?usp=gmail)
 - [Technical Report](VIVID_REPORT.pdf)
 - [GitHub Repository](https://github.com/vivekteja1611/Vivid)
-- [Issues & Bug Reports](https://github.com/vivekteja1611/Vivid/issues)
+- [Presentation}(https://vivekteja1611.github.io/Vivid-presentation/)
 
 ---
 
