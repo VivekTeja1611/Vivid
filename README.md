@@ -344,31 +344,28 @@ pytest tests/
 
 ## 🎯 Roadmap
 
-### Short-term (1-3 months)
+### Short-term 
 - [ ] Fix velocity estimation accuracy
 - [ ] Implement camera calibration
 - [ ] Add offline mode
 - [ ] Improve error handling
 
-### Medium-term (3-6 months)
+### Medium-term
 - [ ] Native mobile application
 - [ ] GPS integration for outdoor navigation
 - [ ] Custom model training
 - [ ] Advanced sensor fusion
 
-### Long-term (6+ months)
+### Long-term
 - [ ] Indoor mapping capabilities
 - [ ] Social features and community
 - [ ] Integration with smart city infrastructure
 - [ ] Research publication and dataset creation
 
 ## 📚 Documentation
-
-- [Installation Guide](docs/installation.md)
 - [API Reference](docs/api.md)
 - [Architecture Overview](docs/architecture.md)
-- [Contributing Guidelines](CONTRIBUTING.md)
-- [Technical Report](docs/technical_report.pdf)
+- [Technical Report](VIVID_REPORT.pdf)
 
 ## 📄 License
 
@@ -394,7 +391,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🔗 Links
 
 - [Live Demo](https://vivekteja1611.github.io/Vivid-presentation/)
-- [Technical Report](docs/technical_report.pdf)
+- [Technical Report](VIVID_REPORT.pdf)
 - [GitHub Repository](https://github.com/vivekteja1611/Vivid)
 - [Issues & Bug Reports](https://github.com/vivekteja1611/Vivid/issues)
 
