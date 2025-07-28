@@ -284,9 +284,7 @@ python app.py
 | `Module not found` | Reinstall requirements: `pip install -r requirements.txt` |
 | `Network timeout` | Check firewall and network connectivity |
 
-## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
 ### Development Setup
 
@@ -300,9 +298,6 @@ pip install -e .
 
 # Install development dependencies
 pip install -r requirements-dev.txt
-
-# Run tests
-pytest tests/
 ```
 
 ### Areas for Contribution
